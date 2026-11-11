@@ -1,0 +1,153 @@
+
+name: MoodleShield CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  terraform-validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6"
+
+      - name: Terraform init
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform -chdir=terraform validate
+
+      - name: Terraform format check
+        run: terraform -chdir=terraform fmt -check -recursive
+
+  ansible-lint:
+    name: Lint Ansible playbooks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible Lint
+        run: python -m pip install ansible-lint
+
+      - name: Install Ansible collections
+        run: |
+          ansible-galaxy collection install \
+            community.general \
+            community.postgresql \
+            ansible.posix
+
+      - name: Validate Ansible syntax
+        run: ansible-playbook ansible/site.yml --syntax-check
+
+      - name: Run Ansible Lint
+        run: ansible-lint ansible/site.yml
+
+  php-analysis:
+    name: PHP syntax validation (Reading Library plugin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          coverage: none
+
+      - name: Validate plugin directory
+        run: test -d moodle/plugins/mod_readinglibrary
+
+      - name: Validate PHP syntax
+        run: |
+          find moodle/plugins/mod_readinglibrary \
+            -type f -name '*.php' -print0 |
+            xargs -0 -r -n1 php -l
+
+  shellcheck:
+    name: ShellCheck all scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "./scripts"
+
+  security-scan:
+    name: Secrets and IaC security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs:
+      - terraform-validate
+      - ansible-lint
+      - php-analysis
+      - shellcheck
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check staging credentials
+        id: staging
+        env:
+          MOODLE_HOST: ${{ secrets.STAGING_HOST }}
+          MOODLE_PASS: ${{ secrets.STAGING_ADMIN_PASS }}
+        run: |
+          if [[ -n "$MOODLE_HOST" && -n "$MOODLE_PASS" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Staging credentials found."
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Staging credentials missing."
+            echo "Skipping integration and security tests."
+          fi
+
+      - name: Run integration test suite
+        if: steps.staging.outputs.ready == 'true'
+        env:
+          MOODLE_HOST: ${{ secrets.STAGING_HOST }}
+          MOODLE_PASS: ${{ secrets.STAGING_ADMIN_PASS }}
+        run: bash tests/integration/integration_test.sh
+
+      - name: Run security test suite
+        if: steps.staging.outputs.ready == 'true'
+        env:
+          MOODLE_HOST: ${{ secrets.STAGING_HOST }}
+        run: bash tests/security/security_test.sh
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: /tmp/moodle-test-*.log
+          if-no-files-found: warn
+
